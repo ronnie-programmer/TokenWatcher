@@ -392,6 +392,16 @@
   const RANGE_LABELS = { '7D': 'Last 7 days', '30D': 'Last 30 days', '3M': 'Last 3 months', '1Y': 'Last year', 'All': 'All time' };
   const DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 
+  // Everything below renders through innerHTML, and prompt text, file paths and
+  // project names are all attacker-shaped input (paste an HTML snippet into a
+  // prompt and it used to execute here). Escape at every interpolation.
+  const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+  const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ESC_MAP[c]);
+
+  // Local calendar date. The server buckets daily totals in local time, so the
+  // client has to agree or "today" lands in the wrong bucket after UTC midnight.
+  const localDate = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+
   const store = (k, def) => localStorage.getItem(k) ?? def;
   let currentPlan  = store('claudePlan', 'pro');
   let currentRange = store('claudeRange', '30D');
@@ -419,7 +429,7 @@
     if (m.includes('sonnet')) cls = 'pill-sonnet';
     else if (m.includes('opus')) cls = 'pill-opus';
     else if (m.includes('haiku')) cls = 'pill-haiku';
-    return `<span class="model-pill ${cls}">${(model||'').replace('claude-','')}</span>`;
+    return `<span class="model-pill ${cls}">${esc((model||'').replace('claude-',''))}</span>`;
   };
   const timeAgo = ts => {
     if (!ts) return '';
@@ -451,7 +461,7 @@
     let start = !isFinite(days) ? new Date(allDaily[0].date) : (() => { const s = new Date(today); s.setDate(s.getDate()-days+1); return s; })();
     const out = [];
     for (let d = new Date(start); d <= today; d.setDate(d.getDate()+1)) {
-      const date = d.toISOString().slice(0,10);
+      const date = localDate(d);
       out.push(map[date] || { date, cost: 0, inputTokens: 0, outputTokens: 0, messages: 0 });
     }
     return out;
@@ -503,7 +513,7 @@
         const a = v > 0 ? (0.12 + (v / max) * 0.88) : 0;
         const bg = v > 0 ? `rgba(167,139,250,${a.toFixed(2)})` : 'var(--surface2)';
         const tip = hmMode === 'cost' ? `${DAYS[d]} ${h}:00 — ${fmtCost(v)}` : `${DAYS[d]} ${h}:00 — ${v} msgs`;
-        html += `<div class="hm-cell" style="background:${bg}" title="${tip}"></div>`;
+        html += `<div class="hm-cell" style="background:${bg}" title="${esc(tip)}"></div>`;
       }
     }
     el.innerHTML = html;
@@ -540,7 +550,7 @@
   function renderPlan(data) {
     const plan = PLANS[currentPlan];
     document.getElementById('plan-name-label').textContent = plan.label;
-    const today = new Date().toISOString().slice(0,10);
+    const today = localDate(new Date());
     const todayOutput = (data.daily||[]).find(d => d.date === today)?.outputTokens || 0;
     if (!isFinite(plan.dailyOutputTokens)) {
       document.getElementById('plan-tokens-left').textContent = '∞';
@@ -567,7 +577,7 @@
     document.getElementById('runaway-list').innerHTML = runaway.length ? runaway.map(m => `
       <div class="flag-row">
         <div class="main"><span>${fmt(m.out)} tokens</span><span class="task-cost" style="font-size:11px">${fmtCost(m.cost)}</span></div>
-        <div class="detail">${m.project} · ${m.tools} tool calls · ${timeAgo(m.ts)}</div>
+        <div class="detail">${esc(m.project)} · ${m.tools} tool calls · ${timeAgo(m.ts)}</div>
       </div>`).join('') : '<div class="flag-empty">No outputs over threshold</div>';
 
     // Edit thrash
@@ -575,8 +585,8 @@
     document.getElementById('thrash-count').textContent = thrash.length;
     document.getElementById('thrash-list').innerHTML = thrash.length ? thrash.map(f => `
       <div class="flag-row warn">
-        <div class="main"><span>${fileName(f.file)}</span><span style="color:var(--orange);font-weight:700">${f.edits}×</span></div>
-        <div class="detail">${f.project}</div>
+        <div class="main"><span>${esc(fileName(f.file))}</span><span style="color:var(--orange);font-weight:700">${f.edits}×</span></div>
+        <div class="detail">${esc(f.project)}</div>
       </div>`).join('') : '<div class="flag-empty">No files over threshold</div>';
 
     // Debug loops
@@ -585,7 +595,7 @@
     document.getElementById('debug-list').innerHTML = loops.length ? loops.map(t => `
       <div class="flag-row info">
         <div class="main"><span>${t.toolCalls} tool calls</span><span class="task-cost" style="font-size:11px">${fmtCost(t.cost)}</span></div>
-        <div class="detail">${(t.promptPreview||'(no prompt)').slice(0,46)}</div>
+        <div class="detail">${esc((t.promptPreview||'(no prompt)').slice(0,46))}</div>
       </div>`).join('') : '<div class="flag-empty">No long loops over threshold</div>';
   }
 
@@ -611,7 +621,7 @@
     // Model table
     const byModel = data.byModel || [];
     document.getElementById('model-table-body').innerHTML = byModel.length
-      ? byModel.map(m => `<tr><td>${modelPill(m.model)}</td><td>${m.sessions}</td><td>${fmt(m.inputTokens)}</td><td>${fmt(m.outputTokens)}</td><td style="color:var(--green)">${fmtCost(m.totalCost)}</td></tr>`).join('')
+      ? byModel.map(m => `<tr><td>${modelPill(m.model)}${m.estimated ? '<span title="No published price for this model — cost is a rough guess" style="color:var(--orange);font-size:10px"> ~est</span>' : ''}</td><td>${m.sessions}</td><td>${fmt(m.inputTokens)}</td><td>${fmt(m.outputTokens)}</td><td style="color:var(--green)">${fmtCost(m.totalCost)}</td></tr>`).join('')
       : '<tr><td colspan="5" style="color:var(--text-muted);text-align:center;padding:16px">No data</td></tr>';
 
     // Tool table
@@ -619,7 +629,7 @@
     const maxToolCalls = byTool.reduce((m, t) => t.count > m ? t.count : m, 1);
     document.getElementById('tool-table-body').innerHTML = byTool.length
       ? byTool.map(tl => `<tr>
-          <td><span class="tool-tag">${tl.tool}</span></td>
+          <td><span class="tool-tag">${esc(tl.tool)}</span></td>
           <td>${tl.count}</td>
           <td>${num(tl.avgOutputTokens)}</td>
           <td><div class="pct-cell"><div class="pct-bar-track"><div class="pct-bar-fill" style="width:${Math.round(tl.count/maxToolCalls*100)}%;background:var(--purple)"></div></div></div></td>
@@ -633,9 +643,9 @@
       ? tasks.map(tk => `
         <div class="task-item">
           <div>
-            <div class="task-prompt">${tk.promptPreview || '(no prompt text)'}</div>
+            <div class="task-prompt">${esc(tk.promptPreview || '(no prompt text)')}</div>
             <div class="task-meta">
-              <span class="proj-tag">${tk.project}</span>
+              <span class="proj-tag">${esc(tk.project)}</span>
               <span class="task-stat">out <span>${fmt(tk.outputTokens)}</span></span>
               <span class="task-stat">tools <span>${tk.toolCalls}</span></span>
               <span class="task-stat">${timeAgo(tk.ts)}</span>
@@ -652,7 +662,7 @@
       ? byProject.map(p => {
           const pct = ((p.totalCost/totalCost)*100).toFixed(1);
           return `<tr>
-            <td style="font-weight:600;color:var(--text)">${p.project}</td>
+            <td style="font-weight:600;color:var(--text)">${esc(p.project)}</td>
             <td>${p.sessions}</td><td>${fmt(p.outputTokens)}</td>
             <td style="color:var(--green)">${fmtCost(p.totalCost)}</td>
             <td><div class="pct-cell"><span style="color:var(--text-dim)">${pct}%</span><div class="pct-bar-track"><div class="pct-bar-fill" style="width:${Math.round(p.totalCost/totalCost*100)}%"></div></div></div></td>
@@ -663,8 +673,8 @@
     document.getElementById('sessions-list').innerHTML = sessions.slice(0,20).map(s => `
       <div class="session-item">
         <div>
-          <div class="session-id">${s.sessionId}</div>
-          <div class="session-meta">${modelPill(s.model)}<span class="proj-tag">${s.project||'?'}</span>
+          <div class="session-id">${esc(s.sessionId)}</div>
+          <div class="session-meta">${modelPill(s.model)}<span class="proj-tag">${esc(s.project||'?')}</span>
             <span class="session-stat">out <span>${fmt(s.outputTokens)}</span></span>
             <span class="session-stat">cache <span>${fmt(s.cacheReadTokens)}</span></span>
             <span class="session-stat">msgs <span>${s.messageCount}</span></span>
@@ -781,7 +791,7 @@
 
   function checkBudget(data) {
     if (!budgetLimit || budgetAlerted) return;
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDate(new Date());
     const todayCost = (data.daily || []).find(d => d.date === today)?.cost || 0;
     if (todayCost >= budgetLimit) {
       budgetAlerted = true;
@@ -802,7 +812,7 @@
     const projects = (lastData.byProject || []).map(p => p.project);
     ['cmp-a', 'cmp-b'].forEach((id, i) => {
       const sel = document.getElementById(id);
-      sel.innerHTML = projects.map((p, j) => `<option value="${p}" ${j === i ? 'selected' : ''}>${p}</option>`).join('');
+      sel.innerHTML = projects.map((p, j) => `<option value="${esc(p)}" ${j === i ? 'selected' : ''}>${esc(p)}</option>`).join('');
     });
     renderCompare();
     document.getElementById('compare-modal').style.display = 'flex';
@@ -823,7 +833,7 @@
       const winner = aVal < bVal ? 'a' : aVal > bVal ? 'b' : '';
       const badge = who => winner === who ? `<span style="color:var(--green);font-size:10px"> ✓</span>` : '';
       return `<tr>
-        <td style="color:var(--text-dim);padding:8px 10px;font-size:12px">${label}</td>
+        <td style="color:var(--text-dim);padding:8px 10px;font-size:12px">${esc(label)}</td>
         <td style="padding:8px 10px;text-align:right;font-size:12px;color:${winner==='a'?'var(--green)':'var(--text)'}">${fmtFn(aVal)}${badge('a')}</td>
         <td style="padding:8px 10px;text-align:right;font-size:12px;color:${winner==='b'?'var(--green)':'var(--text)'}">${fmtFn(bVal)}${badge('b')}</td>
       </tr>`;
@@ -834,8 +844,8 @@
         <thead>
           <tr style="background:var(--surface2)">
             <th style="padding:8px 10px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--text-dim)">Metric</th>
-            <th style="padding:8px 10px;text-align:right;font-size:11px;color:var(--purple);font-weight:700">${pA}</th>
-            <th style="padding:8px 10px;text-align:right;font-size:11px;color:var(--blue);font-weight:700">${pB}</th>
+            <th style="padding:8px 10px;text-align:right;font-size:11px;color:var(--purple);font-weight:700">${esc(pA)}</th>
+            <th style="padding:8px 10px;text-align:right;font-size:11px;color:var(--blue);font-weight:700">${esc(pB)}</th>
           </tr>
         </thead>
         <tbody style="background:var(--surface)">

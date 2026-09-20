@@ -9,26 +9,45 @@ const TERMINAL_MODE = process.argv.includes('--terminal') || process.argv.includ
 
 const app = express();
 const PORT = 3737;
+const HOST = '127.0.0.1';
 const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 
+// Public Anthropic API list prices, USD per 1M tokens.
+// cacheWrite is the 5-minute TTL rate; a 1h-TTL cache write costs more and is
+// not distinguished here (the JSONL does not record the TTL).
 const PRICING = {
-  'claude-sonnet-4-6': { input: 3.00, output: 15.00, cacheWrite: 3.75, cacheRead: 0.30 },
-  'claude-sonnet-4-5': { input: 3.00, output: 15.00, cacheWrite: 3.75, cacheRead: 0.30 },
-  'claude-opus-4-8':   { input: 15.00, output: 75.00, cacheWrite: 18.75, cacheRead: 1.50 },
-  'claude-opus-4-7':   { input: 15.00, output: 75.00, cacheWrite: 18.75, cacheRead: 1.50 },
-  'claude-opus-4-6':   { input: 15.00, output: 75.00, cacheWrite: 18.75, cacheRead: 1.50 },
-  'claude-haiku-4-5':  { input: 0.80,  output: 4.00,  cacheWrite: 1.00,  cacheRead: 0.08 },
-  default:             { input: 3.00,  output: 15.00, cacheWrite: 3.75,  cacheRead: 0.30 },
+  'claude-fable-5-1':  { input: 10.00, output: 50.00, cacheWrite: 12.50, cacheRead: 0.25 },
+  'claude-fable-5':    { input: 10.00, output: 50.00, cacheWrite: 12.50, cacheRead: 1.00 },
+  'claude-opus-5':     { input: 5.00,  output: 25.00, cacheWrite: 6.25,  cacheRead: 0.50 },
+  'claude-opus-4-8':   { input: 5.00,  output: 25.00, cacheWrite: 6.25,  cacheRead: 0.50 },
+  'claude-opus-4-7':   { input: 5.00,  output: 25.00, cacheWrite: 6.25,  cacheRead: 0.50 },
+  'claude-opus-4-6':   { input: 5.00,  output: 25.00, cacheWrite: 6.25,  cacheRead: 0.50 },
+  'claude-sonnet-5':   { input: 2.00,  output: 10.00, cacheWrite: 2.50,  cacheRead: 0.20 },
+  'claude-sonnet-4-6': { input: 3.00,  output: 15.00, cacheWrite: 3.75,  cacheRead: 0.30 },
+  'claude-sonnet-4-5': { input: 3.00,  output: 15.00, cacheWrite: 3.75,  cacheRead: 0.30 },
+  'claude-haiku-4-5':  { input: 1.00,  output: 5.00,  cacheWrite: 1.25,  cacheRead: 0.10 },
 };
+
+// Used when a model id matches nothing above. Kept separate from PRICING so an
+// unpriced model can never be silently mistaken for a real match.
+const FALLBACK_PRICING = { input: 3.00, output: 15.00, cacheWrite: 3.75, cacheRead: 0.30 };
+
+// Longest prefix first, so 'claude-fable-5-1' is not swallowed by 'claude-fable-5'.
+const PRICING_KEYS = Object.keys(PRICING).sort((a, b) => b.length - a.length);
+
+// Model ids seen in the logs that we have no published price for. Surfaced in
+// the payload so the UI can mark those numbers as guesses instead of hiding it.
+const unpricedModels = new Set();
 
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 
 function getPricing(model) {
-  if (!model) return PRICING.default;
-  for (const [key, val] of Object.entries(PRICING)) {
-    if (model.startsWith(key)) return val;
+  if (!model) return FALLBACK_PRICING;
+  for (const key of PRICING_KEYS) {
+    if (model.startsWith(key)) return PRICING[key];
   }
-  return PRICING.default;
+  unpricedModels.add(model);
+  return FALLBACK_PRICING;
 }
 
 function calcCost(usage, model) {
@@ -56,6 +75,13 @@ function projectDisplayName(folderName) {
 
 const emptyHeatmap = () => Array.from({ length: 7 }, () => new Array(24).fill(0));
 
+// Calendar date in THIS machine's timezone. Timestamps in the JSONL are UTC, so
+// slicing the ISO string would roll the day over at UTC midnight and disagree
+// with the heatmap (which has always been local). Everything buckets local now.
+function localDate(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
 // Pull readable text out of a user message; '' if it's a tool result / non-text.
 function userPromptText(msg) {
   const c = msg.content;
@@ -80,16 +106,19 @@ function isUserPrompt(record) {
   return true;
 }
 
-async function parseSessionFile(filePath, projectName) {
+// `seenMsgIds` is owned by the caller so a response that Claude Code replayed
+// into a second .jsonl (resumed sessions copy their history) is counted once
+// across the whole scan, not once per file.
+async function parseSessionFile(filePath, projectName, seenMsgIds) {
   const sessions = {};
   const daily = {};
   const tasks = [];
   const messages = [];          // assistant messages: { sid, project, ts, out, cost }
   const toolCounts = {};        // name -> { count, outTokens }
   const fileEdits = {};         // `${sid}::${file}` -> { sid, project, file, edits }
+  const byModel = {};           // model -> token/cost rollup, attributed per message
   const heatmapCost = emptyHeatmap();
   const heatmapMsgs = emptyHeatmap();
-  const seenMsgIds = new Set();
   const seenPrompts = new Set();
 
   let currentTask = null;
@@ -112,7 +141,10 @@ async function parseSessionFile(filePath, projectName) {
     // ── User prompt → starts a new task ──────────────────────────────────────
     if (isUserPrompt(record)) {
       const text = userPromptText(record.message);
-      const key = sessionId + '::' + text.slice(0, 120);
+      // Branch-duplicated prompts share a timestamp; a genuinely retyped prompt
+      // ("continue", "yes", "fix it") does not. Keying on text alone dropped the
+      // repeat AND folded its tokens into the previous task.
+      const key = sessionId + '::' + (ts || '') + '::' + text.slice(0, 120);
       if (seenPrompts.has(key)) continue; // dedup branch-duplicated prompts
       seenPrompts.add(key);
       closeTask();
@@ -144,9 +176,28 @@ async function parseSessionFile(filePath, projectName) {
         sessionId, model, firstSeen: ts, lastSeen: ts,
         inputTokens: 0, outputTokens: 0, cacheWriteTokens: 0,
         cacheReadTokens: 0, totalCost: 0, messageCount: 0, project: projectName,
+        modelCounts: {},
       };
     }
     const s = sessions[sessionId];
+    s.modelCounts[model] = (s.modelCounts[model] || 0) + 1;
+
+    // Per-model rollup is done per message, not per session: a session that
+    // switches Opus -> Sonnet mid-run used to dump every token on whichever
+    // model happened to answer first.
+    if (!byModel[model]) {
+      byModel[model] = {
+        model, inputTokens: 0, outputTokens: 0, cacheWriteTokens: 0,
+        cacheReadTokens: 0, totalCost: 0, sessionIds: new Set(),
+      };
+    }
+    const bm = byModel[model];
+    bm.inputTokens += usage.input_tokens || 0;
+    bm.outputTokens += out;
+    bm.cacheWriteTokens += usage.cache_creation_input_tokens || 0;
+    bm.cacheReadTokens += usage.cache_read_input_tokens || 0;
+    bm.totalCost += cost;
+    bm.sessionIds.add(sessionId);
     s.inputTokens += usage.input_tokens || 0;
     s.outputTokens += out;
     s.cacheWriteTokens += usage.cache_creation_input_tokens || 0;
@@ -191,14 +242,14 @@ async function parseSessionFile(filePath, projectName) {
     if (ts) {
       if (!s.firstSeen || ts < s.firstSeen) s.firstSeen = ts;
       if (!s.lastSeen || ts > s.lastSeen) s.lastSeen = ts;
-      const date = ts.slice(0, 10);
+      const d = new Date(ts);            // local time of this machine
+      const date = localDate(d);
       if (!daily[date]) daily[date] = { date, cost: 0, inputTokens: 0, outputTokens: 0, messages: 0 };
       daily[date].cost += cost;
       daily[date].inputTokens += usage.input_tokens || 0;
       daily[date].outputTokens += out;
       daily[date].messages++;
 
-      const d = new Date(ts);            // local time of this machine
       const dow = d.getDay(), hr = d.getHours();
       heatmapCost[dow][hr] += cost;
       heatmapMsgs[dow][hr] += 1;
@@ -206,7 +257,16 @@ async function parseSessionFile(filePath, projectName) {
   }
   closeTask();
 
-  return { sessions: Object.values(sessions), daily, tasks, messages, toolCounts, fileEdits, heatmapCost, heatmapMsgs };
+  // Label each session with the model that answered most of its messages, and
+  // keep the full list so a mixed session is visibly mixed.
+  for (const s of Object.values(sessions)) {
+    const entries = Object.entries(s.modelCounts).sort((a, b) => b[1] - a[1]);
+    if (entries.length) s.model = entries[0][0];
+    s.models = entries.map(([m]) => m);
+    delete s.modelCounts;
+  }
+
+  return { sessions: Object.values(sessions), daily, tasks, messages, toolCounts, fileEdits, byModel, heatmapCost, heatmapMsgs };
 }
 
 function mergeHeatmap(target, src) {
@@ -216,21 +276,25 @@ function mergeHeatmap(target, src) {
 async function scanAll() {
   const all = {
     sessions: [], daily: {}, tasks: [], messages: [],
-    toolCounts: {}, fileEdits: {},
+    toolCounts: {}, fileEdits: {}, byModel: {},
     heatmapCost: emptyHeatmap(), heatmapMsgs: emptyHeatmap(),
   };
   if (!fs.existsSync(PROJECTS_DIR)) return all;
 
+  // Shared across every file in the scan so replayed history is not double-counted.
+  const seenMsgIds = new Set();
+
   for (const proj of fs.readdirSync(PROJECTS_DIR)) {
     const projPath = path.join(PROJECTS_DIR, proj);
     let files;
-    try { files = fs.readdirSync(projPath); } catch { continue; }
+    try { files = fs.readdirSync(projPath); }
+    catch (err) { console.warn(`Skipped project ${proj}: ${err.message}`); continue; }
     const projectName = projectDisplayName(proj);
 
     for (const file of files) {
       if (!file.endsWith('.jsonl')) continue;
       try {
-        const r = await parseSessionFile(path.join(projPath, file), projectName);
+        const r = await parseSessionFile(path.join(projPath, file), projectName, seenMsgIds);
         all.sessions.push(...r.sessions);
         all.tasks.push(...r.tasks);
         all.messages.push(...r.messages);
@@ -250,23 +314,39 @@ async function scanAll() {
           if (!all.fileEdits[fk]) all.fileEdits[fk] = { ...fe, edits: 0 };
           all.fileEdits[fk].edits += fe.edits;
         }
+        for (const [name, m] of Object.entries(r.byModel)) {
+          if (!all.byModel[name]) {
+            all.byModel[name] = {
+              model: name, inputTokens: 0, outputTokens: 0, cacheWriteTokens: 0,
+              cacheReadTokens: 0, totalCost: 0, sessionIds: new Set(),
+            };
+          }
+          const t = all.byModel[name];
+          t.inputTokens += m.inputTokens;
+          t.outputTokens += m.outputTokens;
+          t.cacheWriteTokens += m.cacheWriteTokens;
+          t.cacheReadTokens += m.cacheReadTokens;
+          t.totalCost += m.totalCost;
+          for (const sid of m.sessionIds) t.sessionIds.add(sid);
+        }
         mergeHeatmap(all.heatmapCost, r.heatmapCost);
         mergeHeatmap(all.heatmapMsgs, r.heatmapMsgs);
-      } catch {}
+      } catch (err) {
+        console.warn(`Skipped session file ${file}: ${err.message}`);
+      }
     }
   }
   return all;
 }
 
 function aggregateStats(scan) {
-  const { sessions, daily, tasks, messages, toolCounts, fileEdits, heatmapCost, heatmapMsgs } = scan;
+  const { sessions, daily, tasks, messages, toolCounts, fileEdits, byModel, heatmapCost, heatmapMsgs } = scan;
 
   const totals = {
     inputTokens: 0, outputTokens: 0, cacheWriteTokens: 0,
     cacheReadTokens: 0, totalCost: 0, messageCount: 0,
     sessionCount: sessions.length,
   };
-  const byModel = {};
   const byProject = {};
 
   for (const s of sessions) {
@@ -276,15 +356,6 @@ function aggregateStats(scan) {
     totals.cacheReadTokens += s.cacheReadTokens;
     totals.totalCost += s.totalCost;
     totals.messageCount += s.messageCount;
-
-    const m = s.model || 'unknown';
-    if (!byModel[m]) byModel[m] = { model: m, inputTokens: 0, outputTokens: 0, cacheWriteTokens: 0, cacheReadTokens: 0, totalCost: 0, sessions: 0 };
-    byModel[m].inputTokens += s.inputTokens;
-    byModel[m].outputTokens += s.outputTokens;
-    byModel[m].cacheWriteTokens += s.cacheWriteTokens;
-    byModel[m].cacheReadTokens += s.cacheReadTokens;
-    byModel[m].totalCost += s.totalCost;
-    byModel[m].sessions++;
 
     const p = s.project || 'unknown';
     if (!byProject[p]) byProject[p] = { project: p, inputTokens: 0, outputTokens: 0, totalCost: 0, sessions: 0 };
@@ -309,9 +380,14 @@ function aggregateStats(scan) {
 
   const dailyArr = Object.values(daily).sort((a, b) => a.date.localeCompare(b.date));
 
+  const modelList = Object.values(byModel)
+    .map(({ sessionIds, ...m }) => ({ ...m, sessions: sessionIds.size, estimated: unpricedModels.has(m.model) }))
+    .sort((a, b) => b.totalCost - a.totalCost);
+
   return {
     totals,
-    byModel: Object.values(byModel),
+    byModel: modelList,
+    unpricedModels: [...unpricedModels],
     byProject: Object.values(byProject).sort((a, b) => b.totalCost - a.totalCost),
     byTool,
     sessions,
@@ -333,19 +409,49 @@ function broadcast(data) {
 
 let lastStats = null;
 let isScanning = false;
+let rescanQueued = false;
 
-async function refresh() {
-  if (isScanning) return;
+// A file change landing mid-scan used to be dropped outright, leaving the
+// dashboard stale until the *next* write. Queue it and loop instead.
+async function withScan(onStats, onError) {
+  if (isScanning) { rescanQueued = true; return; }
   isScanning = true;
   try {
-    const scan = await scanAll();
-    lastStats = { ...aggregateStats(scan), updatedAt: new Date().toISOString() };
-    broadcast({ type: 'update', ...lastStats });
+    do {
+      rescanQueued = false;
+      const scan = await scanAll();
+      lastStats = { ...aggregateStats(scan), updatedAt: new Date().toISOString() };
+      onStats(lastStats);
+    } while (rescanQueued);
   } catch (err) {
-    console.error('Scan error:', err.message);
+    onError(err);
   } finally {
     isScanning = false;
   }
+}
+
+function refresh() {
+  return withScan(
+    stats => broadcast({ type: 'update', ...stats }),
+    err => console.error('Scan error:', err.message),
+  );
+}
+
+// chokidar fires repeatedly while a session file is being appended to; coalesce.
+function debounce(fn, ms) {
+  let timer = null;
+  return () => { clearTimeout(timer); timer = setTimeout(fn, ms); };
+}
+
+function watchProjects(handler) {
+  const onChange = debounce(handler, 300);
+  return chokidar.watch(PROJECTS_DIR, {
+    ignored: /[/\\]\./,
+    persistent: true,
+    ignoreInitial: true,
+    depth: 2,
+    usePolling: false,
+  }).on('add', onChange).on('change', onChange);
 }
 
 app.use(express.static(path.join(__dirname, 'public')));
@@ -366,6 +472,12 @@ app.get('/api/events', (req, res) => {
   if (lastStats) res.write(`data: ${JSON.stringify({ type: 'update', ...lastStats })}\n\n`);
   req.on('close', () => clients.delete(res));
 });
+
+// Comment-only keepalive: without traffic an idle SSE connection gets reaped and
+// the dashboard silently falls back to its 3s reconnect loop.
+setInterval(() => {
+  for (const res of clients) { try { res.write(': ping\n\n'); } catch {} }
+}, 25_000).unref();
 
 // ── Terminal UI ──────────────────────────────────────────────────────────────
 
@@ -492,27 +604,12 @@ function drawTerminal(stats) {
 // ── Launch ───────────────────────────────────────────────────────────────────
 
 if (TERMINAL_MODE) {
-  async function termRefresh() {
-    if (isScanning) return;
-    isScanning = true;
-    try {
-      const scan = await scanAll();
-      lastStats = { ...aggregateStats(scan), updatedAt: new Date().toISOString() };
-      drawTerminal(lastStats);
-    } catch (err) {
-      process.stderr.write('Scan error: ' + err.message + '\n');
-    } finally {
-      isScanning = false;
-    }
-  }
+  const termRefresh = () => withScan(
+    drawTerminal,
+    err => process.stderr.write('Scan error: ' + err.message + '\n'),
+  );
 
-  chokidar.watch(PROJECTS_DIR, {
-    ignored: /[/\\]\./,
-    persistent: true,
-    ignoreInitial: true,
-    depth: 2,
-    usePolling: false,
-  }).on('add', termRefresh).on('change', termRefresh);
+  watchProjects(termRefresh);
 
   process.on('SIGINT', () => {
     process.stdout.write('\x1b[?25h\n');
@@ -521,15 +618,11 @@ if (TERMINAL_MODE) {
 
   termRefresh();
 } else {
-  chokidar.watch(PROJECTS_DIR, {
-    ignored: /[/\\]\./,
-    persistent: true,
-    ignoreInitial: true,
-    depth: 2,
-    usePolling: false,
-  }).on('add', refresh).on('change', refresh);
+  watchProjects(refresh);
 
-  app.listen(PORT, async () => {
+  // Loopback only. The payload includes prompt previews, project names and
+  // spend; binding 0.0.0.0 published all of that to anyone on the network.
+  app.listen(PORT, HOST, async () => {
     const url = `http://localhost:${PORT}`;
     console.log(`Claude Token Tracker → ${url}`);
     await refresh();

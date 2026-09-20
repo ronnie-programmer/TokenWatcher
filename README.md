@@ -49,8 +49,8 @@ All three thresholds are adjustable live with sliders — no restart needed.
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/ronnie-progammer/claude-live-token-tracker.git
-cd claude-live-token-tracker
+git clone https://github.com/ronnie-programmer/TokenWatcher.git
+cd TokenWatcher
 
 # 2. Install dependencies
 npm install
@@ -122,6 +122,9 @@ Claude Code writes to → ~/.claude/projects/*.jsonl
 
 ## Notes & Limitations
 
+- **Binds to `127.0.0.1` only.** The dashboard payload includes previews of your prompts, so it is deliberately not reachable from other machines on your network.
+- **Unknown models are marked `~est`** in the model table — if a model has no published price in `PRICING` (`server.js`), its cost is a rough fallback, not a real rate.
+- **Daily totals use your local timezone**, so the daily chart, plan card, budget alert and heatmap all roll over at local midnight.
 - **Cost is an estimate** based on public Anthropic API pricing. If you're on a flat-rate plan (Pro/Max), the cost shown is what the same usage *would* cost on the raw API — not your actual bill.
 - **Plan token limits are community estimates** — Anthropic does not publish exact daily caps.
 - **Task detection is a heuristic** — edge cases exist in Claude Code's conversation-tree format; treat per-task costs as close estimates.
