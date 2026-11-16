@@ -49,8 +49,8 @@ All three thresholds are adjustable live with sliders — no restart needed.
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/ronnie-progammer/claude-live-token-tracker.git
-cd claude-live-token-tracker
+git clone https://github.com/ronnie-programmer/TokenWatcher.git
+cd TokenWatcher
 
 # 2. Install dependencies
 npm install
