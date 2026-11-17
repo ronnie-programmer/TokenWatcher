@@ -1,4 +1,4 @@
-# ⚡ Claude Live Token Tracker
+# ⚡ TokenWatcher
 
 A real-time dashboard that tracks your **Claude Code** token usage, estimated cost, and behavioral patterns. It reads the session files Claude Code writes locally, parses every message, and streams live updates to your browser the moment a new response lands.
 
